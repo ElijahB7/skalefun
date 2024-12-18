@@ -12,6 +12,13 @@ import {BondingCurve} from "./BondingCurve.sol";
 import {Token} from "./Token.sol";
 
 contract TokenFactory is ReentrancyGuard, Ownable {
+
+    struct TokenData {
+        TokenState state;
+        uint256 collateral;
+        uint256 lastTotalSupply;  
+    }
+
     enum TokenState {
         NOT_CREATED,
         FUNDING,
@@ -23,20 +30,36 @@ contract TokenFactory is ReentrancyGuard, Ownable {
     uint256 public constant FUNDING_SUPPLY = (MAX_SUPPLY * 4) / 5;
     uint256 public constant FUNDING_GOAL = 20 ether;
     uint256 public constant FEE_DENOMINATOR = 10000;
+    uint256 private constant PRECISION_SCALE = 1e18;
+    uint256 public constant MAX_FEE_PERCENT = 1000; // 10%
 
     mapping(address => TokenState) public tokens;
     mapping(address => uint256) public collateral;
+    mapping(address => TokenData) internal tokenData;
     address public immutable tokenImplementation;
     address public uniswapV2Router;
     address public uniswapV2Factory;
     BondingCurve public bondingCurve;
     uint256 public feePercent; // bp
     uint256 public fee;
+    bool public paused;
 
     // Events
     event TokenCreated(address indexed token, uint256 timestamp);
     event TokenLiqudityAdded(address indexed token, uint256 timestamp);
+    event TokenSold(address indexed token, address indexed seller, uint256 amount, uint256 ethReceived, uint256 feeAmount);
+    event BondingCurveUpdated(address indexed newBondingCurve);
+    event FeePercentChanged(uint256 newFeePercent);
+    event PausedSet(bool isPaused);
+    event FeesClaimed(address indexed owner, uint256 amount);
 
+    // Errors
+    error TokenNotFunding();
+    error ZeroAmount();
+    error ETHTransferFailed();
+    error InsufficientCollateral();
+
+    
     constructor(
         address _tokenImplementation,
         address _uniswapV2Router,
@@ -44,6 +67,12 @@ contract TokenFactory is ReentrancyGuard, Ownable {
         address _bondingCurve,
         uint256 _feePercent
     ) Ownable(msg.sender) {
+        require(_tokenImplementation != address(0), "Zero address");
+        require(_uniswapV2Router != address(0), "Zero address");
+        require(_uniswapV2Factory != address(0), "Zero address");
+        require(_bondingCurve != address(0), "Zero address");
+        require(_feePercent <= MAX_FEE_PERCENT, "Fee too high");
+    
         tokenImplementation = _tokenImplementation;
         uniswapV2Router = _uniswapV2Router;
         uniswapV2Factory = _uniswapV2Factory;
@@ -54,22 +83,31 @@ contract TokenFactory is ReentrancyGuard, Ownable {
     // Admin functions
 
     function setBondingCurve(address _bondingCurve) external onlyOwner {
+        require(_bondingCurve != address(0), "Zero address");
         bondingCurve = BondingCurve(_bondingCurve);
+        emit BondingCurveUpdated(_bondingCurve);
     }
 
     function setFeePercent(uint256 _feePercent) external onlyOwner {
+        require(_feePercent <= MAX_FEE_PERCENT, "Fee too high");
         feePercent = _feePercent;
+        emit FeePercentChanged(_feePercent);
     }
 
     function claimFee() external onlyOwner {
-        (bool success,) = msg.sender.call{value: fee}(new bytes(0));
+        uint256 amountToTransfer = fee;
+        fee = 0; // Update state before transfer
+        (bool success,) = msg.sender.call{value: amountToTransfer}(new bytes(0));
         require(success, "ETH send failed");
-        fee = 0;
+        emit FeesClaimed(msg.sender, amountToTransfer);
     }
 
     // Token functions
 
-    function createToken(string memory name, string memory symbol) external returns (address) {
+    function createToken(string memory name, string memory symbol) external whenNotPaused returns (address) {
+        require(bytes(name).length > 0 && bytes(name).length <= 32, "Invalid name length");
+        require(bytes(symbol).length > 0 && bytes(symbol).length <= 8, "Invalid symbol length");
+    
         address tokenAddress = Clones.clone(tokenImplementation);
         Token token = Token(tokenAddress);
         token.initialize(name, symbol);
@@ -78,7 +116,7 @@ contract TokenFactory is ReentrancyGuard, Ownable {
         return tokenAddress;
     }
 
-    function buy(address tokenAddress) external payable nonReentrant {
+    function buy(address tokenAddress) external whenNotPaused payable nonReentrant {
         require(tokens[tokenAddress] == TokenState.FUNDING, "Token not found");
         require(msg.value > 0, "ETH not enough");
         // calculate fee
@@ -119,21 +157,43 @@ contract TokenFactory is ReentrancyGuard, Ownable {
         }
     }
 
-    function sell(address tokenAddress, uint256 amount) external nonReentrant {
-        require(tokens[tokenAddress] == TokenState.FUNDING, "Token is not funding");
-        require(amount > 0, "Amount should be greater than zero");
+    function sell(address tokenAddress, uint256 amount) external nonReentrant whenNotPaused returns (uint256 ethReceived) {
+        // Cache storage reads in a single operation
+        TokenState currentState = tokens[tokenAddress];
+        if (currentState != TokenState.FUNDING) revert TokenNotFunding();
+        if (amount == 0) revert ZeroAmount();
+    
+        // Cache storage values
+        uint256 currentCollateral = collateral[tokenAddress];
         Token token = Token(tokenAddress);
-        uint256 receivedETH = bondingCurve.getFundsReceived(token.totalSupply(), amount);
-        // calculate fee
-        uint256 _fee = calculateFee(receivedETH, feePercent);
-        receivedETH -= _fee;
-        fee += _fee;
+    
+        // Perform calculations in unchecked block since we have validations
+        uint256 rawETHAmount;
+        uint256 feeAmount;
+        unchecked {
+            // Get ETH amount and calculate fees
+            rawETHAmount = bondingCurve.getFundsReceived(token.totalSupply(), amount);
+            feeAmount = (rawETHAmount * feePercent) / FEE_DENOMINATOR;
+            ethReceived = rawETHAmount - feeAmount;
+        }
+    
+        // Validate collateral
+        if (currentCollateral < rawETHAmount) revert InsufficientCollateral();
+    
+        // Execute state changes before external calls (CEI pattern)
         token.burn(msg.sender, amount);
-        collateral[tokenAddress] -= receivedETH;
-        // send ether
-        //slither-disable-next-line arbitrary-send-eth
-        (bool success,) = msg.sender.call{value: receivedETH}(new bytes(0));
-        require(success, "ETH send failed");
+    
+        unchecked {
+            // Update state variables
+            collateral[tokenAddress] = currentCollateral - rawETHAmount;
+            fee += feeAmount;
+        }
+
+        // Perform ETH transfer last
+        (bool success,) = msg.sender.call{value: ethReceived}("");
+        if (!success) revert ETHTransferFailed();
+    
+        emit TokenSold(tokenAddress, msg.sender, amount, ethReceived, feeAmount);
     }
 
     // Internal functions
@@ -150,10 +210,21 @@ contract TokenFactory is ReentrancyGuard, Ownable {
         Token token = Token(tokenAddress);
         IUniswapV2Router01 router = IUniswapV2Router01(uniswapV2Router);
         token.approve(uniswapV2Router, tokenAmount);
-        //slither-disable-next-line arbitrary-send-eth
+    
+        uint256 minTokenAmount = tokenAmount * 95 / 100; // 5% slippage
+        uint256 minEthAmount = ethAmount * 95 / 100;
+    
         (,, uint256 liquidity) = router.addLiquidityETH{value: ethAmount}(
-            tokenAddress, tokenAmount, tokenAmount, ethAmount, address(this), block.timestamp
+            tokenAddress, 
+            tokenAmount, 
+            minTokenAmount, 
+            minEthAmount, 
+            address(this), 
+            block.timestamp + 300 // 5 minute deadline
         );
+    
+        // Reset approval
+        token.approve(uniswapV2Router, 0);
         return liquidity;
     }
 
@@ -162,6 +233,16 @@ contract TokenFactory is ReentrancyGuard, Ownable {
     }
 
     function calculateFee(uint256 _amount, uint256 _feePercent) internal pure returns (uint256) {
-        return (_amount * _feePercent) / FEE_DENOMINATOR;
+        return (_amount * _feePercent + FEE_DENOMINATOR / 2) / FEE_DENOMINATOR;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "Contract is paused");
+        _;
+    }
+
+    function setPaused(bool _paused) external onlyOwner {
+        paused = _paused;
+        emit PausedSet(_paused);
     }
 }
