@@ -104,17 +104,24 @@ contract TokenFactory is ReentrancyGuard, Ownable {
 
     // Token functions
 
-    function createToken(string memory name, string memory symbol) external whenNotPaused returns (address) {
-        require(bytes(name).length > 0 && bytes(name).length <= 32, "Invalid name length");
-        require(bytes(symbol).length > 0 && bytes(symbol).length <= 8, "Invalid symbol length");
-    
-        address tokenAddress = Clones.clone(tokenImplementation);
-        Token token = Token(tokenAddress);
-        token.initialize(name, symbol);
-        tokens[tokenAddress] = TokenState.FUNDING;
-        emit TokenCreated(tokenAddress, block.timestamp);
-        return tokenAddress;
-    }
+   function createToken(
+    string memory name, 
+    string memory symbol,
+    string memory ipfsHash,
+    string memory description
+) external whenNotPaused returns (address) {
+    require(bytes(name).length > 0 && bytes(name).length <= 32, "Invalid name length");
+    require(bytes(symbol).length > 0 && bytes(symbol).length <= 8, "Invalid symbol length");
+    require(bytes(ipfsHash).length > 0, "IPFS hash required");
+    require(bytes(description).length > 0, "Description required");
+
+    address tokenAddress = Clones.clone(tokenImplementation);
+    Token token = Token(tokenAddress);
+    token.initialize(name, symbol, ipfsHash, description);
+    tokens[tokenAddress] = TokenState.FUNDING;
+    emit TokenCreated(tokenAddress, block.timestamp);
+    return tokenAddress;
+}
 
     function buy(address tokenAddress) external whenNotPaused payable nonReentrant {
         require(tokens[tokenAddress] == TokenState.FUNDING, "Token not found");
