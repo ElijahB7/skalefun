@@ -2,44 +2,41 @@
 pragma solidity ^0.8.13;
 
 import {FixedPointMathLib} from "lib/solady/src/utils/FixedPointMathLib.sol";
+import {Token} from "./Token.sol";
 
 contract BondingCurve {
     using FixedPointMathLib for uint256;
-    using FixedPointMathLib for int256;
 
-    uint256 public immutable A;
-    uint256 public immutable B;
+    uint256 public immutable INITIAL_PRICE;
+    uint256 public immutable MULTIPLIER;
+    uint256 public constant FUNDING_SUPPLY = 800_000_000 * 1e18; // 800M tokens
 
-    constructor(uint256 _a, uint256 _b) {
-        A = _a;
-        B = _b;
+    constructor() {
+         // Start at 0.0000000045 ETH (4.5 gwei)
+        INITIAL_PRICE = 4_500_000_000;
+        // This multiplier gives us a ~10x increase over 800M tokens
+        MULTIPLIER = 50;
     }
 
-    // calculate the funds received for selling deltaX tokens
-    function getFundsReceived(uint256 x0, uint256 deltaX) public view returns (uint256 deltaY) {
-        uint256 a = A;
-        uint256 b = B;
-        require(x0 >= deltaX);
-        // calculate exp(b*x0), exp(b*x1)
-        int256 exp_b_x0 = (int256(b.mulWad(x0))).expWad();
-        int256 exp_b_x1 = (int256(b.mulWad(x0 - deltaX))).expWad();
-
-        // calculate deltaY = (a/b)*(exp(b*x0) - exp(b*x1))
-        uint256 delta = uint256(exp_b_x0 - exp_b_x1);
-        deltaY = a.fullMulDiv(delta, b);
+    function getCurrentPrice(uint256 currentSupply) public view returns (uint256) {
+        // Base price + linear increase based on current supply
+        // Price should go from 0.00028 ETH to 0.0028 ETH over FUNDING_SUPPLY
+        return INITIAL_PRICE + ((currentSupply * MULTIPLIER) / 1 ether);
     }
 
-    // calculte the number of tokens that can be purchased for a given amount of funds
-    function getAmountOut(uint256 x0, uint256 deltaY) public view returns (uint256 deltaX) {
-        uint256 a = A;
-        uint256 b = B;
-        // calculate exp(b*x0)
-        uint256 exp_b_x0 = uint256((int256(b.mulWad(x0))).expWad());
+    function getAmountOut(address tokenAddress, uint256 ethIn) public view returns (uint256) {
+    Token token = Token(tokenAddress);
+    uint256 currentSupply = token.totalSupply();
+    uint256 currentPrice = getCurrentPrice(currentSupply);  // Use the existing getCurrentPrice function
+    require(currentPrice > 0, "Invalid price");
+    
+    // Calculate tokens out, maintaining wei precision
+    return (ethIn * 1 ether) / currentPrice;
+}
 
-        // calculate exp(b*x0) + (dy*b/a)
-        uint256 exp_b_x1 = exp_b_x0 + deltaY.fullMulDiv(b, a);
-
-        // calculate ln(x1)/b-x0
-        deltaX = uint256(int256(exp_b_x1).lnWad()).divWad(b) - x0;
+    function getFundsReceived(uint256 currentSupply, uint256 tokenAmount) public view returns (uint256) {
+        require(currentSupply >= tokenAmount, "Invalid amount");
+        uint256 currentPrice = getCurrentPrice(currentSupply);
+        return (tokenAmount * currentPrice) / 1 ether;
     }
 }

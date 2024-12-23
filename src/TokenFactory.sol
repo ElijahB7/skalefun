@@ -118,6 +118,8 @@ contract TokenFactory is ReentrancyGuard, Ownable {
     address tokenAddress = Clones.clone(tokenImplementation);
     Token token = Token(tokenAddress);
     token.initialize(name, symbol, ipfsHash, description);
+    
+    // Don't mint everything initially - tokens will be minted as needed during buy()
     tokens[tokenAddress] = TokenState.FUNDING;
     emit TokenCreated(tokenAddress, block.timestamp);
     return tokenAddress;
@@ -126,41 +128,35 @@ contract TokenFactory is ReentrancyGuard, Ownable {
     function buy(address tokenAddress) external whenNotPaused payable nonReentrant {
         require(tokens[tokenAddress] == TokenState.FUNDING, "Token not found");
         require(msg.value > 0, "ETH not enough");
-        // calculate fee
-        uint256 valueToBuy = msg.value;
-        uint256 valueToReturn;
-        uint256 tokenCollateral = collateral[tokenAddress];
 
-        uint256 remainingEthNeeded = FUNDING_GOAL - tokenCollateral;
-        uint256 contributionWithoutFee = valueToBuy * FEE_DENOMINATOR / (FEE_DENOMINATOR + feePercent);
-        if (contributionWithoutFee > remainingEthNeeded) {
-            contributionWithoutFee = remainingEthNeeded;
-        }
-        uint256 _fee = calculateFee(contributionWithoutFee, feePercent);
-        uint256 totalCharged = contributionWithoutFee + _fee;
-        valueToReturn = valueToBuy > totalCharged ? valueToBuy - totalCharged : 0;
-        fee += _fee;
         Token token = Token(tokenAddress);
-        uint256 amount = bondingCurve.getAmountOut(token.totalSupply(), contributionWithoutFee);
-        uint256 availableSupply = FUNDING_SUPPLY - token.totalSupply();
-        require(amount <= availableSupply, "Token supply not enough");
-        tokenCollateral += contributionWithoutFee;
-        token.mint(msg.sender, amount);
-        // when reached FUNDING_GOAL
-        if (tokenCollateral >= FUNDING_GOAL) {
+        uint256 currentSupply = token.totalSupply(); // Remove tokenAddress argument
+        
+        // Calculate fee
+        uint256 contributionWithoutFee = (msg.value * FEE_DENOMINATOR) / (FEE_DENOMINATOR + feePercent);
+        uint256 feeAmount = msg.value - contributionWithoutFee;
+        fee += feeAmount;
+
+        // Calculate tokens out
+        uint256 tokensOut = bondingCurve.getAmountOut(tokenAddress, contributionWithoutFee); // Pass tokenAddress instead of currentSupply
+        require(tokensOut > 0, "No tokens returned");
+        require(currentSupply + tokensOut <= FUNDING_SUPPLY, "Exceeds max supply");
+
+        // Rest of the function remains the same
+        uint256 currentCollateral = collateral[tokenAddress];
+        uint256 newCollateral = currentCollateral + contributionWithoutFee;
+        collateral[tokenAddress] = newCollateral;
+
+        token.mint(msg.sender, tokensOut);
+        
+        if (newCollateral >= FUNDING_GOAL) {
             token.mint(address(this), INITIAL_SUPPLY);
             address pair = createLiquilityPool(tokenAddress);
-            uint256 liquidity = addLiquidity(tokenAddress, INITIAL_SUPPLY, tokenCollateral);
+            uint256 liquidity = addLiquidity(tokenAddress, INITIAL_SUPPLY, newCollateral);
             burnLiquidityToken(pair, liquidity);
-            tokenCollateral = 0;
+            collateral[tokenAddress] = 0;
             tokens[tokenAddress] = TokenState.TRADING;
             emit TokenLiqudityAdded(tokenAddress, block.timestamp);
-        }
-        collateral[tokenAddress] = tokenCollateral;
-        // return left
-        if (valueToReturn > 0) {
-            (bool success,) = msg.sender.call{value: msg.value - valueToBuy}(new bytes(0));
-            require(success, "ETH send failed");
         }
     }
 

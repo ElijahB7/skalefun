@@ -13,8 +13,9 @@ contract DeployTokenFactory is Script {
     address constant UNISWAP_V2_ROUTER = 0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008;
     address constant UNISWAP_V2_FACTORY = 0x7E0987E5b3a30e3f2828572Bb659A548460a3003;
     uint256 constant FEE_PERCENT = 250; // 2.5% in basis points
-    uint256 constant BONDING_CURVE_A = 1e15; // 0.001 ETH
-    uint256 constant BONDING_CURVE_B = 1e12; // 0.000000001
+    // Modified parameters
+    uint256 constant BONDING_CURVE_A = 28000000000; // 0.000000028 ETH
+    uint256 constant BONDING_CURVE_B = 2900000000; // pretty steep curve
 
     function run() external {
         vm.startBroadcast();
